@@ -4,9 +4,13 @@
 # Author             : Podalirius (@podalirius_)
 # Date created       : 20 may 2024
 
-
+from __future__ import annotations
 import io
-import impacket.smbconnection
+from typing import Optional
+from impacket.smbconnection import SMBConnection, SessionError
+from impacket.dcerpc.v5 import transport, rpcrt, srvs
+from impacket.ldap import ldaptypes
+from impacket.nt_errors import STATUS_OBJECT_NAME_COLLISION
 import ntpath
 import os
 import random
@@ -15,7 +19,14 @@ import sys
 import traceback
 from smbclientng.core.LocalFileIO import LocalFileIO
 from smbclientng.core.utils import b_filesize, STYPE_MASK, is_port_open, smb_entry_iterator
+from smbclientng.core.SIDResolver import SIDResolver
+from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from smbclientng.core.Logger import Logger
+    from smbclientng.core.Config import Config
+    from smbclientng.core.Credentials import Credentials
+    from impacket.smb import SharedFile
 
 class SMBSession(object):
     """
@@ -52,8 +63,27 @@ class SMBSession(object):
         read_file(path): Reads a file from the SMB share.
         test_rights(sharename): Tests read and write access rights on a share.
     """
+    config: Config
+    logger: Logger
+    host: str
+    port: int
+    timeout: int
+    advertisedName: Optional[str]
 
-    def __init__(self, host, port, timeout, credentials, advertisedName=None, config=None, logger=None):
+    # Credentials
+    credentials: Credentials
+
+    smbClient: Optional[SMBConnection] = None
+    connected: bool = False
+    dce_srvsvc: Optional[rpcrt.DCERPC_v5] = None
+
+    available_shares: dict[str,dict] = {}
+    smb_share: str = ""
+    smb_cwd: str = ""
+    smb_tree_id: Optional[int] = None
+    sid_resolver: SIDResolver
+
+    def __init__(self, host: str, port: int, timeout: int, credentials: Credentials, advertisedName: Optional[str], config: Config, logger: Logger):
         super(SMBSession, self).__init__()
         # Objects
         self.config = config
@@ -69,14 +99,6 @@ class SMBSession(object):
 
         # Credentials
         self.credentials = credentials
-
-        self.smbClient = None
-        self.connected = False
-
-        self.available_shares = {}
-        self.smb_share = None
-        self.smb_cwd = ""
-        self.smb_tree_id = None
 
         self.list_shares()
 
@@ -103,7 +125,7 @@ class SMBSession(object):
         else:
             raise Exception("SMB client is not initialized.")
 
-    def init_smb_session(self):
+    def init_smb_session(self) -> bool:
         """
         Initializes and establishes a session with the SMB server.
 
@@ -123,7 +145,7 @@ class SMBSession(object):
         try:
             result, error = is_port_open(self.host, self.port, self.timeout)
             if result:
-                self.smbClient = impacket.smbconnection.SMBConnection(
+                self.smbClient = SMBConnection(
                     remoteName=self.host,
                     remoteHost=self.host,
                     myName=self.advertisedName,
@@ -134,86 +156,97 @@ class SMBSession(object):
             else:
                 self.logger.error(f"Could not connect to '{self.host}:{self.port}', {error}.")
                 self.connected = False
-                self.smbClient = None
+                return False
         except OSError as err:
             if self.config.debug:
                 traceback.print_exc()
             self.logger.error("Could not connect to '%s:%d': %s" % (self.host, int(self.port), err))
             self.connected = False
-            self.smbClient = None
+            return False
 
-        if self.smbClient is not None:
-            if self.credentials.use_kerberos:
-                self.logger.debug("[>] Authenticating as '%s\\%s' with kerberos ... " % (self.credentials.domain, self.credentials.username))
+        if self.credentials.use_kerberos:
+            self.logger.debug("[>] Authenticating as '%s\\%s' with kerberos ... " % (self.credentials.domain, self.credentials.username))
+            try:
+                self.connected = self.smbClient.kerberosLogin(
+                    user=self.credentials.username,
+                    password=self.credentials.password,
+                    domain=self.credentials.domain,
+                    lmhash=self.credentials.lm_hex,
+                    nthash=self.credentials.nt_hex,
+                    aesKey=self.credentials.aesKey,
+                    kdcHost=self.credentials.kdcHost
+                )
+            except SessionError as err:
+                if self.config.debug:
+                    traceback.print_exc()
+                self.logger.error("Could not login: %s" % err)
+                self.connected = False
+
+        else:
+            if len(self.credentials.lm_hex) != 0 and len(self.credentials.nt_hex) != 0:
+                self.logger.debug("[>] Authenticating as '%s\\%s' with NTLM with pass the hash ... " % (self.credentials.domain, self.credentials.username))
                 try:
-                    self.connected = self.smbClient.kerberosLogin(
+                    self.logger.debug("  | user     = %s" % self.credentials.username)
+                    self.logger.debug("  | password = %s" % self.credentials.password)
+                    self.logger.debug("  | domain   = %s" % self.credentials.domain)
+                    self.logger.debug("  | lmhash   = %s" % self.credentials.lm_hex)
+                    self.logger.debug("  | nthash   = %s" % self.credentials.nt_hex)
+                    
+                    self.connected = self.smbClient.login(
                         user=self.credentials.username,
                         password=self.credentials.password,
                         domain=self.credentials.domain,
                         lmhash=self.credentials.lm_hex,
-                        nthash=self.credentials.nt_hex,
-                        aesKey=self.credentials.aesKey,
-                        kdcHost=self.credentials.kdcHost
+                        nthash=self.credentials.nt_hex
                     )
-                except impacket.smbconnection.SessionError as err:
+                except SessionError as err:
                     if self.config.debug:
                         traceback.print_exc()
                     self.logger.error("Could not login: %s" % err)
                     self.connected = False
 
             else:
-                if len(self.credentials.lm_hex) != 0 and len(self.credentials.nt_hex) != 0:
-                    self.logger.debug("[>] Authenticating as '%s\\%s' with NTLM with pass the hash ... " % (self.credentials.domain, self.credentials.username))
-                    try:
-                        self.logger.debug("  | user     = %s" % self.credentials.username)
-                        self.logger.debug("  | password = %s" % self.credentials.password)
-                        self.logger.debug("  | domain   = %s" % self.credentials.domain)
-                        self.logger.debug("  | lmhash   = %s" % self.credentials.lm_hex)
-                        self.logger.debug("  | nthash   = %s" % self.credentials.nt_hex)
-                        
-                        self.connected = self.smbClient.login(
-                            user=self.credentials.username,
-                            password=self.credentials.password,
-                            domain=self.credentials.domain,
-                            lmhash=self.credentials.lm_hex,
-                            nthash=self.credentials.nt_hex
-                        )
-                    except impacket.smbconnection.SessionError as err:
-                        if self.config.debug:
-                            traceback.print_exc()
-                        self.logger.error("Could not login: %s" % err)
-                        self.connected = False
+                self.logger.debug("[>] Authenticating as '%s\\%s' with NTLM with password ... " % (self.credentials.domain, self.credentials.username))
+                try:
+                    self.logger.debug("  | user     = %s" % self.credentials.username)
+                    self.logger.debug("  | password = %s" % self.credentials.password)
+                    self.logger.debug("  | domain   = %s" % self.credentials.domain)
+                    self.logger.debug("  | lmhash   = %s" % self.credentials.lm_hex)
+                    self.logger.debug("  | nthash   = %s" % self.credentials.nt_hex)
 
-                else:
-                    self.logger.debug("[>] Authenticating as '%s\\%s' with NTLM with password ... " % (self.credentials.domain, self.credentials.username))
-                    try:
-                        self.logger.debug("  | user     = %s" % self.credentials.username)
-                        self.logger.debug("  | password = %s" % self.credentials.password)
-                        self.logger.debug("  | domain   = %s" % self.credentials.domain)
-                        self.logger.debug("  | lmhash   = %s" % self.credentials.lm_hex)
-                        self.logger.debug("  | nthash   = %s" % self.credentials.nt_hex)
+                    self.connected = self.smbClient.login(
+                        user=self.credentials.username,
+                        password=self.credentials.password,
+                        domain=self.credentials.domain,
+                        lmhash=self.credentials.lm_hex,
+                        nthash=self.credentials.nt_hex
+                    )
+                except SessionError as err:
+                    if self.config.debug:
+                        traceback.print_exc()
+                    self.logger.error("Could not login: %s" % err)
+                    self.connected = False
 
-                        self.connected = self.smbClient.login(
-                            user=self.credentials.username,
-                            password=self.credentials.password,
-                            domain=self.credentials.domain,
-                            lmhash=self.credentials.lm_hex,
-                            nthash=self.credentials.nt_hex
-                        )
-                    except impacket.smbconnection.SessionError as err:
-                        if self.config.debug:
-                            traceback.print_exc()
-                        self.logger.error("Could not login: %s" % err)
-                        self.connected = False
-
-            if self.connected:
-                self.logger.print("[+] Successfully authenticated to '%s' as '%s\\%s'!" % (self.host, self.credentials.domain, self.credentials.username))
-            else:
-                self.logger.error("Failed to authenticate to '%s' as '%s\\%s'!" % (self.host, self.credentials.domain, self.credentials.username))
+        if self.connected:
+            self.logger.print("[+] Successfully authenticated to '%s' as '%s\\%s'!" % (self.host, self.credentials.domain, self.credentials.username))
+            try:
+                self.sid_resolver = SIDResolver(self.smbClient)
+            except Exception as err:
+                self.logger.error(f"SIDResolver could not be initialized: {err}")
+            try:
+                rpctransport = transport.SMBTransport(self.smbClient.getRemoteName(), self.smbClient.getRemoteHost(), filename=r'\srvsvc',
+                                                    smb_connection=self.smbClient)
+                self.dce_srvsvc = rpctransport.get_dce_rpc()
+                self.dce_srvsvc.connect()
+                self.dce_srvsvc.bind(srvs.MSRPC_UUID_SRVS)
+            except Exception as err:
+                self.logger.error(f"Could not initialize connection to srvsvc: {err}")
+        else:
+            self.logger.error("Failed to authenticate to '%s' as '%s\\%s'!" % (self.host, self.credentials.domain, self.credentials.username))
 
         return self.connected
 
-    def ping_smb_session(self):
+    def ping_smb_session(self) -> bool:
         """
         Tests the connectivity to the SMB server by sending an echo command.
 
@@ -237,7 +270,7 @@ class SMBSession(object):
         return self.connected
 
     # Operations
-    def get_file(self, path=None, keepRemotePath=False, localDownloadDir="./", is_recursive=False):
+    def get_file(self, path: Optional[str] = None, keepRemotePath: bool = False, localDownloadDir: str ="./", is_recursive: bool = False):
         """
         Retrieves files or directories from the specified path(s) on the SMB share.
 
@@ -347,7 +380,7 @@ class SMBSession(object):
                 self.logger.error(f"Failed to download '{path}': {e}")
 
 
-    def download_file(self, full_path, outputfile, keepRemotePath):
+    def download_file(self, full_path: str, outputfile: str, keepRemotePath: bool):
         """Downloads a single file."""
         try:
             # Get the file entry
@@ -360,9 +393,9 @@ class SMBSession(object):
                 f = LocalFileIO(
                     mode="wb",
                     path=outputfile,
+                    logger=self.logger,
                     expected_size=entry.get_filesize(),
                     keepRemotePath=keepRemotePath,
-                    logger=self.logger
                 )
                 try:
                     self.smbClient.getFile(
@@ -376,7 +409,7 @@ class SMBSession(object):
             self.logger.error(f"Failed to download '{full_path}': {e}")
 
 
-    def get_file_recursively(self, path=None, localDownloadDir="./"):
+    def get_file_recursively(self, path: Optional[str] = None, localDownloadDir: str = "./"):
         """
         Recursively retrieves files from a specified path on the SMB share.
 
@@ -416,9 +449,9 @@ class SMBSession(object):
                         f = LocalFileIO(
                             mode="wb",
                             path=downloadToPath, 
+                            logger=self.logger,
                             expected_size=entry_file.get_filesize(),
                             keepRemotePath=True,
-                            logger=self.logger
                         )
                         try:
                             self.smbClient.getFile(
@@ -441,7 +474,9 @@ class SMBSession(object):
                             base_dir=self.smb_cwd,
                             path=path+[entry_directory.get_longname()],
                             localDownloadDir=localDownloadDir
-                        )                   
+                        )
+        if path is None:
+            path = self.smb_cwd or ''
         # Entrypoint
         try:
             if path.startswith(ntpath.sep):
@@ -456,12 +491,12 @@ class SMBSession(object):
                 path=[path],
                 localDownloadDir=localDownloadDir
             )
-        except (BrokenPipeError, KeyboardInterrupt) as e:
+        except (BrokenPipeError, KeyboardInterrupt):
             print("\x1b[v\x1b[o\r[!] Interrupted.")
             self.close_smb_session()
             self.init_smb_session()
 
-    def get_entry(self, path=None):
+    def get_entry(self, path: Optional[str] = None) -> Optional[SharedFile]:
         """
         Retrieves information about a specific entry located at the provided path on the SMB share.
 
@@ -487,7 +522,7 @@ class SMBSession(object):
         else:
             return None 
 
-    def info(self, share=True, server=True):
+    def info(self, share: bool = True, server: bool = True):
         """
         Displays information about the server and optionally the shares.
 
@@ -544,11 +579,11 @@ class SMBSession(object):
                 self.logger.print("  └─")
 
         if share and self.smb_share is not None:
-            share_name = self.available_shares.get(self.smb_share.lower(), "")["name"]
-            share_comment = self.available_shares.get(self.smb_share.lower(), "")["comment"]
-            share_type = self.available_shares.get(self.smb_share.lower(), "")["type"]
+            share_name = self.available_shares.get(self.smb_share.lower(), {"name": ""})["name"]
+            share_comment = self.available_shares.get(self.smb_share.lower(), {"comment": ""})["comment"]
+            share_type = self.available_shares.get(self.smb_share.lower(), {"type": ""})["type"]
             share_type =', '.join([s.replace("STYPE_","") for s in share_type])
-            share_rawtype = self.available_shares.get(self.smb_share.lower(), "")["rawtype"]
+            share_rawtype = self.available_shares.get(self.smb_share.lower(), {"rawtype": ""})["rawtype"]
             if self.config.no_colors:
                 self.logger.print("\n[+] Share:")
                 self.logger.print("  ├─ Name ──────────── : %s" % (share_name))
@@ -562,7 +597,7 @@ class SMBSession(object):
                 self.logger.print("  ├─ \x1b[94mType\x1b[0m \x1b[90m────────────\x1b[0m : \x1b[93m%s\x1b[0m" % (share_type))
                 self.logger.print("  └─ \x1b[94mRaw type value\x1b[0m \x1b[90m──\x1b[0m : \x1b[93m%s\x1b[0m" % (share_rawtype))
 
-    def list_contents(self, path=None):
+    def list_contents(self, path: Optional[str] = None) -> dict[str, SharedFile]:
         """
         Lists the contents of a specified directory on the SMB share.
 
@@ -593,8 +628,87 @@ class SMBSession(object):
             contents[entry.get_longname()] = entry
 
         return contents
+    
+    def printSecurityDescriptorTable(self, security_descriptor: str, subject: str, prefix: str = " "*13, table_colors: bool = False):
+        self.logger.print(self.securityDescriptorTable(security_descriptor, subject, prefix, table_colors))
 
-    def list_shares(self):
+    def securityDescriptorTable(self, security_descriptor: str, subject: str, prefix: str = " "*13, table_colors: bool = False) -> str:
+        if security_descriptor is not None and len(security_descriptor) == 0:
+            return ""
+        out_sd = ""
+        sd = ldaptypes.SR_SECURITY_DESCRIPTOR()
+        sd.fromString(security_descriptor)
+        try:
+            self.sid_resolver.resolve_sids(set(
+                ([sd['OwnerSid'].formatCanonical()] if len(sd['OwnerSid']) != 0 else []) 
+                + ([sd['GroupSid'].formatCanonical()] if len(sd['GroupSid']) != 0 else []) 
+                + [acl['Ace']['Sid'].formatCanonical() for acl in sd['Dacl']['Data'] if len(acl['Ace']['Sid']) != 0]))
+        except Exception as err:
+            self.logger.debug(f"Could not resolve SID for {subject}: {str(err)}")
+            traceback.print_exc()
+        max_resolved_sid_length = max([len(i) for i in self.sid_resolver.cache.values()] + [0])
+
+        if len(sd['OwnerSid']) != 0:
+            resolved_owner_sid = self.sid_resolver.get_sid(sd['OwnerSid'].formatCanonical())
+            resolved_group_sid = self.sid_resolver.get_sid(sd['GroupSid'].formatCanonical())
+
+            if self.config.no_colors:
+                out_sd += f"{prefix}Owner:   {resolved_owner_sid}\n"
+                out_sd += f"{prefix}Group:   {resolved_group_sid}"
+            else:
+                if table_colors:
+                    out_sd += f"{prefix}Owner:   [bold yellow]{resolved_owner_sid}[/bold yellow]\n"
+                    out_sd += f"{prefix}Group:   [bold yellow]{resolved_group_sid}[/bold yellow]"
+                else:
+                    out_sd += f"{prefix}Owner:   \x1b[1m{resolved_owner_sid}\x1b[0m\n"
+                    out_sd += f"{prefix}Group:   \x1b[1m{resolved_group_sid}\x1b[0m"
+        
+        for i, acl in enumerate(sd['Dacl']['Data']):
+            resolved_sid = acl['Ace']['Sid'].formatCanonical() if len(acl['Ace']['Sid']) != 0 else ""
+            if resolved_sid in ["S-1-5-32-544", "S-1-5-18"]:
+                continue
+            
+            flags = []
+            for flag in ["GENERIC_READ", "GENERIC_WRITE", "GENERIC_EXECUTE", "GENERIC_ALL", "MAXIMUM_ALLOWED", "ACCESS_SYSTEM_SECURITY", "WRITE_OWNER", "WRITE_DACL", "DELETE", "READ_CONTROL", "SYNCHRONIZE"]:
+                if len(acl['Ace']['Mask']) != 0 and acl['Ace']['Mask'].hasPriv(getattr(ldaptypes.ACCESS_MASK, flag)):
+                    flags.append(flag)
+            if len(flags) == 0:
+                continue
+            try:
+                resolved_sid = self.sid_resolver.get_sid(resolved_sid) if resolved_sid else ""
+            except Exception as err:
+                self.logger.debug(f"Could not resolve SID {resolved_sid} for {subject}: {str(err)}")
+
+            acl_string = prefix
+            inbetween = ""
+            if len(resolved_sid) < max_resolved_sid_length+1:
+                inbetween = " "*(max_resolved_sid_length+1-len(resolved_sid))
+            
+            if self.config.no_colors:
+                acl_string += f"{resolved_sid}" + ' | '.join(flags)
+            else:
+                acl_string += "Allowed: " if acl['TypeName'] == "ACCESS_ALLOWED_ACE" else "Denied:  "
+                if table_colors:
+                    acl_string += f"[bold yellow]{resolved_sid}[/bold yellow]"
+                else:
+                    acl_string += f"\x1b[1m{resolved_sid}\x1b[0m"
+                acl_string += inbetween
+                acl_string += ' | '.join(flags)
+            out_sd += "\n" + acl_string
+        return out_sd.lstrip("\n")
+
+    def listSharesDetailed(self) -> dict:
+        """
+        get a list of available shares at the connected target
+
+        :return: a list containing dict entries for each share
+        :raise SessionError: if error
+        """
+        # Get the shares through RPC
+        resp = srvs.hNetrShareEnum(self.dce_srvsvc, 502, serverName="\\\\" + self.smbClient.getRemoteHost())
+        return resp['InfoStruct']['ShareInfo']['Level502']['Buffer']
+
+    def list_shares(self) -> dict[str,dict]:
         """
         Lists all the shares available on the connected SMB server.
 
@@ -610,27 +724,47 @@ class SMBSession(object):
 
         if self.connected:
             if self.smbClient is not None:
-                resp = self.smbClient.listShares()
+                try:
+                    resp = self.listSharesDetailed()
+                    for share in resp:
+                        # SHARE_INFO_502 structure (lmshare.h)
+                        # https://learn.microsoft.com/en-us/windows/win32/api/lmshare/ns-lmshare-share_info_502
+                        sharename = share["shi502_netname"][:-1]
+                        sharecomment = share["shi502_remark"][:-1]
+                        sharetype = share["shi502_type"]
+                        sharesd = share["shi502_security_descriptor"]
 
-                for share in resp:
-                    # SHARE_INFO_1 structure (lmshare.h)
-                    # https://learn.microsoft.com/en-us/windows/win32/api/lmshare/ns-lmshare-share_info_1
-                    sharename = share["shi1_netname"][:-1]
-                    sharecomment = share["shi1_remark"][:-1]
-                    sharetype = share["shi1_type"]
+                        self.available_shares[sharename.lower()] = {
+                            "name": sharename,
+                            "type": STYPE_MASK(sharetype),
+                            "rawtype": sharetype,
+                            "comment": sharecomment,
+                            "security_descriptor": sharesd
+                        }
+                except Exception as err:
+                    self.logger.debug(f"Could not get detailed share info: {str(err)}")
+                    resp = self.smbClient.listShares()
 
-                    self.available_shares[sharename.lower()] = {
-                        "name": sharename, 
-                        "type": STYPE_MASK(sharetype), 
-                        "rawtype": sharetype, 
-                        "comment": sharecomment
-                    }
+                    for share in resp:
+                        # SHARE_INFO_1 structure (lmshare.h)
+                        # https://learn.microsoft.com/en-us/windows/win32/api/lmshare/ns-lmshare-share_info_1
+                        sharename = share["shi1_netname"][:-1]
+                        sharecomment = share["shi1_remark"][:-1]
+                        sharetype = share["shi1_type"]
+
+                        self.available_shares[sharename.lower()] = {
+                            "name": sharename,
+                            "type": STYPE_MASK(sharetype),
+                            "rawtype": sharetype,
+                            "comment": sharecomment
+                        }
+
             else:
                 self.logger.error("Error: SMBSession.smbClient is None.")
 
         return self.available_shares
 
-    def mkdir(self, path=None):
+    def mkdir(self, path: str):
         """
         Creates a directory at the specified path on the SMB share.
 
@@ -639,42 +773,38 @@ class SMBSession(object):
         the creation for that directory without raising an error.
 
         Args:
-            path (str, optional): The full path of the directory to create on the SMB share. Defaults to None.
+            path (str): The full path of the directory to create on the SMB share. Defaults to None.
 
         Note:
             The path should use forward slashes ('/') which will be converted to backslashes (ntpath.sep) for SMB compatibility.
         """
 
-        if path is not None:
-            # Prepare path
-            path = path.replace('/',ntpath.sep)
-            if ntpath.sep in path:
-                path = path.strip(ntpath.sep).split(ntpath.sep)
-            else:
-                path = [path]
-
-            # Create each dir in the path
-            for depth in range(1, len(path)+1):
-                tmp_path = ntpath.sep.join(path[:depth])
-                try:
-                    self.smbClient.createDirectory(
-                        shareName=self.smb_share, 
-                        pathName=ntpath.normpath(self.smb_cwd + ntpath.sep + tmp_path + ntpath.sep)
-                    )
-                except impacket.smbconnection.SessionError as err:
-                    if err.getErrorCode() == 0xc0000035:
-                        # STATUS_OBJECT_NAME_COLLISION
-                        # Remote directory already created, this is normal
-                        # Src: https://github.com/fortra/impacket/blob/269ce69872f0e8f2188a80addb0c39fedfa6dcb8/impacket/nt_errors.py#L268C9-L268C19
-                        pass
-                    else:
-                        self.logger.error("Failed to create directory '%s': %s" % (tmp_path, err))
-                        if self.config.debug:
-                            traceback.print_exc()
+        # Prepare path
+        split_path = path.replace('/',ntpath.sep)
+        if ntpath.sep in path:
+            split_path = path.strip(ntpath.sep).split(ntpath.sep)
         else:
-            pass
+            split_path = [split_path]
 
-    def mount(self, local_mount_point, remote_path):
+        # Create each dir in the path
+        for depth in range(1, len(split_path)+1):
+            tmp_path = ntpath.sep.join(split_path[:depth])
+            try:
+                self.smbClient.createDirectory(
+                    shareName=self.smb_share, 
+                    pathName=ntpath.normpath(self.smb_cwd + ntpath.sep + tmp_path + ntpath.sep)
+                )
+            except SessionError as err:
+                if err.getErrorCode() == STATUS_OBJECT_NAME_COLLISION:
+                    # Remote directory already created, this is normal
+                    # Src: https://github.com/fortra/impacket/blob/269ce69872f0e8f2188a80addb0c39fedfa6dcb8/impacket/nt_errors.py#L268C9-L268C19
+                    pass
+                else:
+                    self.logger.error("Failed to create directory '%s': %s" % (tmp_path, err))
+                    if self.config.debug:
+                        traceback.print_exc()
+
+    def mount(self, local_mount_point: str, remote_path: str):
         """
         Generates the command to mount an SMB share on different platforms.
 
@@ -719,7 +849,7 @@ class SMBSession(object):
                 self.logger.debug("Executing: %s" % command)
             os.system(command)
 
-    def path_exists(self, path=None):
+    def path_exists(self, path: Optional[str] = None):
         """
         Checks if the specified path exists on the SMB share.
 
@@ -747,7 +877,7 @@ class SMBSession(object):
         else:
             return False
    
-    def path_isdir(self, pathFromRoot=None):
+    def path_isdir(self, pathFromRoot: Optional[str] = None):
         """
         Checks if the specified path is a directory on the SMB share.
 
@@ -790,7 +920,7 @@ class SMBSession(object):
         else:
             return False
 
-    def path_isfile(self, pathFromRoot=None):
+    def path_isfile(self, pathFromRoot: Optional[str] = None):
         """
         Checks if the specified path is a file on the SMB share.
 
@@ -829,7 +959,7 @@ class SMBSession(object):
         else:
             return False
 
-    def put_file(self, localpath=None):
+    def put_file(self, localpath: str):
         """
         Uploads a single file to the SMB share.
 
@@ -905,7 +1035,7 @@ class SMBSession(object):
                 # [!] The specified localpath does not exist.
                 pass
 
-    def put_file_recursively(self, localpath=None):
+    def put_file_recursively(self, localpath: Optional[str] = None):
         """
         Recursively uploads files from a specified local directory to the SMB share.
 
@@ -917,6 +1047,9 @@ class SMBSession(object):
         Args:
             localpath (str, optional): The local directory path from which files will be uploaded. Defaults to None.
         """
+
+        if localpath is None:
+            localpath = "./"
 
         if os.path.exists(localpath):
             if os.path.isdir(localpath):
@@ -941,7 +1074,7 @@ class SMBSession(object):
                             f = LocalFileIO(
                                 mode="rb", 
                                 path=local_dir_path + os.path.sep + local_file_path, 
-                                debug=self.config.debug
+                                logger=self.logger
                             )
                             self.smbClient.putFile(
                                 shareName=self.smb_share, 
@@ -965,7 +1098,7 @@ class SMBSession(object):
         else:
             self.logger.error("The specified localpath does not exist.")
 
-    def read_file(self, path=None):
+    def read_file(self, path: Optional[str] = None):
         """
         Reads a file from the SMB share.
 
@@ -995,7 +1128,7 @@ class SMBSession(object):
                 # opening the files in streams instead of mounting shares allows 
                 # for running the script from unprivileged containers
                 self.smbClient.getFile(self.smb_share, tmp_file_path, fh.write)
-            except impacket.smbconnection.SessionError as e:
+            except SessionError as e:
                 return None
             rawdata = fh.getvalue()
             fh.close()
@@ -1003,7 +1136,7 @@ class SMBSession(object):
         else:
             return None
 
-    def rmdir(self, path=None):
+    def rmdir(self, path: str):
         """
         Removes a directory from the SMB share at the specified path.
 
@@ -1012,8 +1145,9 @@ class SMBSession(object):
         the stack trace of the exception.
 
         Args:
-            path (str, optional): The path of the directory to be removed on the SMB share. Defaults to None.
+            path (str): The path of the directory to be removed on the SMB share. Defaults to None.
         """
+
         try:
             self.smbClient.deleteDirectory(
                 shareName=self.smb_share, 
@@ -1024,7 +1158,7 @@ class SMBSession(object):
             if self.config.debug:
                 traceback.print_exc()
 
-    def rm(self, path=None):
+    def rm(self, path: str):
         """
         Removes a file from the SMB share at the specified path.
 
@@ -1033,7 +1167,7 @@ class SMBSession(object):
         the stack trace of the exception.
 
         Args:
-            path (str, optional): The path of the file to be removed on the SMB share. Defaults to None.
+            path (str): The path of the file to be removed on the SMB share. Defaults to None.
         """
 
         # Parse path
@@ -1077,7 +1211,7 @@ class SMBSession(object):
                 if self.config.debug:
                     traceback.print_exc()
 
-    def tree(self, path=None, quiet=False, outputfile=None):
+    def tree(self, path: Optional[str] = None, quiet: bool = False, outputfile: Optional[str] = None):
         """
         Recursively lists the directory structure of the SMB share starting from the specified path.
 
@@ -1169,7 +1303,7 @@ class SMBSession(object):
         except Exception as e:
             self.logger.error(f"Error during tree traversal: {e}")
 
-    def umount(self, local_mount_point):
+    def umount(self, local_mount_point: str):
         """
         Unmounts the specified local mount point of the remote share.
 
@@ -1202,7 +1336,7 @@ class SMBSession(object):
 
     # Other functions
 
-    def test_rights(self, sharename, test_write=False): 
+    def test_rights(self, sharename: str, test_write: bool = False): 
         """
         Tests the read and write access rights of the current SMB session.
 
@@ -1224,7 +1358,7 @@ class SMBSession(object):
         try:
             self.smbClient.listPath(self.smb_share, '*', password=None)
             access_rights["readable"] = True
-        except impacket.smbconnection.SessionError as e:
+        except SessionError:
             access_rights["readable"] = False
         
         
@@ -1235,7 +1369,7 @@ class SMBSession(object):
                 self.smbClient.createDirectory(self.smb_share, temp_dir)
                 self.smbClient.deleteDirectory(self.smb_share, temp_dir)
                 access_rights["writable"] = True
-            except impacket.smbconnection.SessionError as e:
+            except SessionError:
                 access_rights["writable"] = False
 
         # Restore the current share
@@ -1245,7 +1379,7 @@ class SMBSession(object):
 
     # Setter / Getter
 
-    def set_share(self, shareName):
+    def set_share(self, shareName: str):
         """
         Sets the current SMB share to the specified share name.
 
@@ -1268,7 +1402,7 @@ class SMBSession(object):
                 # Connects the tree
                 try:
                     self.smb_tree_id = self.smbClient.connectTree(self.smb_share)
-                except impacket.smbconnection.SessionError as err:
+                except SessionError as err:
                     self.smb_share = None
                     self.smb_cwd = ""
                     self.logger.error("Could not access share '%s': %s" % (shareName, err))
@@ -1277,7 +1411,7 @@ class SMBSession(object):
         else:
             self.smb_share = None
             
-    def set_cwd(self, path=None):
+    def set_cwd(self, path: Optional[str] = None):
         """
         Sets the current working directory on the SMB share to the specified path.
 
