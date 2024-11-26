@@ -1072,9 +1072,6 @@ class InteractiveShell(object):
             if do_check_rights:
                 table.add_column("Rights")
 
-            if do_check_rights:
-                table.add_column("Rights")
-
             security_descriptor = list(shares.values())[0].get("security_descriptor")
             if security_descriptor is not None:
                 table.add_column("Security Descriptor")

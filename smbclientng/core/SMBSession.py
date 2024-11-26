@@ -78,7 +78,7 @@ class SMBSession(object):
     connected: bool = False
 
     available_shares: dict[str,dict] = {}
-    smb_share: str = ""
+    smb_share: Optional[str] = None
     smb_cwd: str = ""
     smb_tree_id: Optional[int] = None
     dce_srvsvc: Optional[rpcrt.DCERPC_v5] = None
